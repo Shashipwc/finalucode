@@ -1,92 +1,91 @@
-name: Export OIC3 project from source
+# OCI DevOps — Export OIC3 project and upload .car to Object Storage
+# No Vault — all values come from Pipeline → Parameters tab.
+#
+# Build spec path: build_spec_export.yaml
+#
+version: 0.1
+component: build
+timeoutInSeconds: 3600
+shell: bash
+failImmediatelyOnError: true
 
-on:
-  workflow_dispatch:
-    inputs:
-      project_id:
-        description: "Source Oracle Integration project identifier"
-        required: true
-      project_label:
-        description: "Optional deployment label/version, for example 01.00.0000"
-        required: false
-        default: ""
-      archive_name:
-        description: "Archive file name to create under exports/"
-        required: true
-        default: "project-export.car"
+env:
+  variables:
+    PARAM_PROJECT_ID: "${PARAM_PROJECT_ID}"
+    PARAM_ARCHIVE_NAME: "${PARAM_ARCHIVE_NAME}"
+    PARAM_PROJECT_LABEL: "${PARAM_PROJECT_LABEL}"
+    PARAM_OS_OBJECT_NAME: "${PARAM_OS_OBJECT_NAME}"
+    OS_BUCKET: "${OS_BUCKET}"
+    OS_NAMESPACE: "${OS_NAMESPACE}"
+    SRC_TOKEN_URL: "${SRC_TOKEN_URL}"
+    SRC_CLIENT_ID: "${SRC_CLIENT_ID}"
+    SRC_CLIENT_SECRET: "${SRC_CLIENT_SECRET}"
+    SRC_SCOPE: "${SRC_SCOPE}"
+    SRC_OIC_BASE_URL: "${SRC_OIC_BASE_URL}"
+    SRC_OIC_INSTANCE: "${SRC_OIC_INSTANCE}"
+  exportedVariables:
+    - OS_OBJECT_NAME
+    - ARCHIVE_PATH
 
-permissions:
-  contents: write
+steps:
+  - type: Command
+    name: Setup
+    command: |
+      set -euo pipefail
+      cd "${OCI_PRIMARY_SOURCE_DIR:-.}"
+      echo "=== OIC Export ==="
+      if command -v jq >/dev/null 2>&1; then
+        echo "jq: OK"
+      elif command -v yum >/dev/null 2>&1; then
+        yum install -y jq
+      elif command -v apt-get >/dev/null 2>&1; then
+        apt-get update -y && apt-get install -y jq
+      fi
+      command -v jq oci curl
+      mkdir -p exports
+      chmod +x scripts/*.sh
+      export OCI_CLI_AUTH="${OCI_CLI_AUTH:-resource_principal}"
+      export ARCHIVE_PATH="exports/${PARAM_ARCHIVE_NAME}"
+      export OS_OBJECT_NAME="${PARAM_OS_OBJECT_NAME:-oic-exports/${PARAM_ARCHIVE_NAME}}"
+      : "${SRC_TOKEN_URL:?Missing SRC_TOKEN_URL}"
+      : "${SRC_CLIENT_ID:?Missing SRC_CLIENT_ID}"
+      : "${SRC_CLIENT_SECRET:?Missing SRC_CLIENT_SECRET}"
+      : "${SRC_SCOPE:?Missing SRC_SCOPE}"
+      : "${SRC_OIC_BASE_URL:?Missing SRC_OIC_BASE_URL}"
+      : "${SRC_OIC_INSTANCE:?Missing SRC_OIC_INSTANCE}"
+      : "${OS_BUCKET:?Missing OS_BUCKET}"
+      : "${PARAM_PROJECT_ID:?Missing PARAM_PROJECT_ID}"
+      : "${PARAM_ARCHIVE_NAME:?Missing PARAM_ARCHIVE_NAME}"
+      echo "Project:  ${PARAM_PROJECT_ID}"
+      echo "Archive:  ${ARCHIVE_PATH}"
+      echo "Bucket:   ${OS_BUCKET}"
+      echo "Object:   ${OS_OBJECT_NAME}"
 
-jobs:
-  export-project:
-    runs-on: ubuntu-latest
+  - type: Command
+    name: Export from source OIC
+    command: |
+      set -euo pipefail
+      cd "${OCI_PRIMARY_SOURCE_DIR:-.}"
+      export OCI_CLI_AUTH="${OCI_CLI_AUTH:-resource_principal}"
+      export ARCHIVE_PATH="exports/${PARAM_ARCHIVE_NAME}"
+      TOKEN="$(scripts/get_token.sh "${SRC_TOKEN_URL}" "${SRC_CLIENT_ID}" "${SRC_CLIENT_SECRET}" "${SRC_SCOPE}")"
+      scripts/export_project.sh \
+        "${SRC_OIC_BASE_URL}" \
+        "${SRC_OIC_INSTANCE}" \
+        "${TOKEN}" \
+        "${PARAM_PROJECT_ID}" \
+        "${PARAM_PROJECT_LABEL:-}" \
+        "${ARCHIVE_PATH}"
+      test -f "${ARCHIVE_PATH}"
+      ls -la "${ARCHIVE_PATH}"
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install jq
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq
-
-      - name: Validate source configuration
-        run: |
-          echo "Validating required secrets and inputs..."
-          test -n "${{ secrets.SRC_TOKEN_URL }}"
-          test -n "${{ secrets.SRC_CLIENT_ID }}"
-          test -n "${{ secrets.SRC_CLIENT_SECRET }}"
-          test -n "${{ secrets.SRC_SCOPE }}"
-          test -n "${{ secrets.SRC_OIC_BASE_URL }}"
-          test -n "${{ secrets.SRC_OIC_INSTANCE }}"
-          test -n "${{ github.event.inputs.project_id }}"
-          test -n "${{ github.event.inputs.archive_name }}"
-
-          echo "Token URL host:"
-          echo "${{ secrets.SRC_TOKEN_URL }}" | sed 's#https://##' | cut -d/ -f1
-
-          echo "OIC base URL host:"
-          echo "${{ secrets.SRC_OIC_BASE_URL }}" | sed 's#https://##' | cut -d/ -f1
-
-      - name: Get source access token
-        id: token
-        run: |
-          chmod +x scripts/get_token.sh
-          TOKEN=$(scripts/get_token.sh \
-            "${{ secrets.SRC_TOKEN_URL }}" \
-            "${{ secrets.SRC_CLIENT_ID }}" \
-            "${{ secrets.SRC_CLIENT_SECRET }}" \
-            "${{ secrets.SRC_SCOPE }}")
-          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
-
-      - name: Export project from source OIC3
-        run: |
-          mkdir -p exports
-          chmod +x scripts/export_project.sh
-          scripts/export_project.sh \
-            "${{ secrets.SRC_OIC_BASE_URL }}" \
-            "${{ secrets.SRC_OIC_INSTANCE }}" \
-            "${{ steps.token.outputs.token }}" \
-            "${{ github.event.inputs.project_id }}" \
-            "${{ github.event.inputs.project_label }}" \
-            "exports/${{ github.event.inputs.archive_name }}"
-
-      - name: Verify exported archive
-        run: |
-          test -f "exports/${{ github.event.inputs.archive_name }}"
-          ls -lh "exports/${{ github.event.inputs.archive_name }}"
-
-      - name: Commit exported archive
-        run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@users.noreply.github.com"
-          git add "exports/${{ github.event.inputs.archive_name }}"
-          git commit -m "Export OIC3 project ${{ github.event.inputs.project_id }}" || echo "No changes to commit"
-          git push
-
-      - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: exported-car
-          path: exports/${{ github.event.inputs.archive_name }}
+  - type: Command
+    name: Upload to Object Storage
+    command: |
+      set -euo pipefail
+      cd "${OCI_PRIMARY_SOURCE_DIR:-.}"
+      export OCI_CLI_AUTH="${OCI_CLI_AUTH:-resource_principal}"
+      export ARCHIVE_PATH="exports/${PARAM_ARCHIVE_NAME}"
+      export OS_OBJECT_NAME="${PARAM_OS_OBJECT_NAME:-oic-exports/${PARAM_ARCHIVE_NAME}}"
+      scripts/oss_object_put.sh "${ARCHIVE_PATH}" "${OS_BUCKET}" "${OS_OBJECT_NAME}"
+      echo "Export complete. Object key: ${OS_OBJECT_NAME}"
