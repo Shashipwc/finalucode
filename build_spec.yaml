@@ -1,83 +1,133 @@
+# =============================================================================
+# OCI DevOps — OIC Export (source) → Object Storage → Import (target)
+# =============================================================================
+# Repo layout (build spec at repo root):
+#   build_spec_export_import.yaml
+#   scripts/get_token.sh
+#   scripts/export_project.sh
+#   scripts/import_project.sh
+#   scripts/oss_object_put.sh
+#   scripts/oss_object_get.sh
+#
+# Managed Build stage → Build spec file path: build_spec_export_import.yaml
+#
+# Pipeline → Parameters (exact names; use real values, never ${VAR} in env.variables):
+#
+#   REQUIRED
+#     PROJECT_ID, ARCHIVE_NAME, OS_BUCKET
+#     SRC_TOKEN_URL, SRC_CLIENT_ID, SRC_CLIENT_SECRET, SRC_OIC_BASE_URL, SRC_OIC_INSTANCE
+#     TGT_TOKEN_URL, TGT_CLIENT_ID, TGT_CLIENT_SECRET, TGT_OIC_BASE_URL, TGT_OIC_INSTANCE
+#
+#   OPTIONAL: SRC_SCOPE, TGT_SCOPE, PROJECT_LABEL, OS_NAMESPACE, OS_OBJECT_NAME
+# =============================================================================
 version: 0.1
 component: build
 timeoutInSeconds: 7200
 shell: bash
 failImmediatelyOnError: true
-
 env:
   variables:
     ARCHIVE_NAME: "project-export.car"
-    OS_NAMESPACE: ""
-    PROJECT_LABEL: ""
-    OS_OBJECT_NAME: ""
   exportedVariables:
     - OS_OBJECT_NAME
     - ARCHIVE_PATH
-
 steps:
   - type: Command
     name: Setup
     command: |
       set -euo pipefail
       cd "${OCI_PRIMARY_SOURCE_DIR:-.}"
-      echo "=== OIC Export + Import ==="
-      if ! command -v jq >/dev/null; then
-        apt-get update -y && apt-get install -y jq 2>/dev/null || yum install -y jq
-      fi
-      command -v jq curl oci
+      echo "=== OIC Export + Import — Setup ==="
+      echo "Runner: $(cat /etc/oracle-release 2>/dev/null || grep PRETTY_NAME /etc/os-release 2>/dev/null || uname -a)"
+      echo "Working directory: $(pwd)"
+      ls -la
+      install_pkg() {
+        local pkg="$1"
+        if command -v dnf >/dev/null 2>&1; then dnf install -y "${pkg}";
+        elif command -v yum >/dev/null 2>&1; then yum install -y "${pkg}";
+        elif command -v microdnf >/dev/null 2>&1; then microdnf install -y "${pkg}";
+        elif command -v apt-get >/dev/null 2>&1; then apt-get update -y && apt-get install -y "${pkg}";
+        else echo "ERROR: cannot install ${pkg}"; exit 1; fi
+      }
+      for pkg in jq curl; do
+        command -v "${pkg}" >/dev/null 2>&1 || { echo "Installing ${pkg}..."; install_pkg "${pkg}"; }
+        command -v "${pkg}" >/dev/null || { echo "ERROR: ${pkg} missing"; exit 1; }
+        echo "OK: ${pkg} -> $(command -v "${pkg}")"
+      done
+      command -v oci >/dev/null || { echo "ERROR: oci CLI missing"; exit 1; }
+      echo "OK: oci -> $(command -v oci)"
+      for f in scripts/get_token.sh scripts/export_project.sh scripts/import_project.sh scripts/oss_object_put.sh scripts/oss_object_get.sh; do
+        [ -f "${f}" ] || { echo "ERROR: missing ${f}"; exit 1; }
+        chmod +x "${f}"; echo "OK: ${f}"
+      done
       mkdir -p exports
-      chmod +x scripts/*.sh
       export OCI_CLI_AUTH="${OCI_CLI_AUTH:-resource_principal}"
       export ARCHIVE_NAME="${ARCHIVE_NAME:-project-export.car}"
       export ARCHIVE_PATH="exports/${ARCHIVE_NAME}"
       export OS_OBJECT_NAME="${OS_OBJECT_NAME:-oic-exports/${ARCHIVE_NAME}}"
-
-      check_param() {
-        local n="$1" v="${!1:-}"
-        if [ -z "${v}" ]; then
-          echo "ERROR: '${n}' is empty — add Pipeline → Parameter named exactly '${n}'"
-          exit 1
-        fi
-        case "${v}" in '${'*'}'|'$'"${n}"|*'${'"${n}"'}'*)
-          echo "ERROR: '${n}' is a placeholder (${v})"
-          exit 1
-        ;; esac
-      }
-      for n in SRC_TOKEN_URL SRC_CLIENT_ID SRC_CLIENT_SECRET SRC_SCOPE SRC_OIC_BASE_URL SRC_OIC_INSTANCE \
-               TGT_TOKEN_URL TGT_CLIENT_ID TGT_CLIENT_SECRET TGT_SCOPE TGT_OIC_BASE_URL TGT_OIC_INSTANCE \
-               OS_BUCKET PROJECT_ID ARCHIVE_NAME; do
-        check_param "${n}"
+      trim() { echo "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//"; }
+      for n in PROJECT_ID ARCHIVE_NAME PROJECT_LABEL OS_OBJECT_NAME OS_BUCKET OS_NAMESPACE \
+               SRC_TOKEN_URL SRC_CLIENT_ID SRC_CLIENT_SECRET SRC_SCOPE SRC_OIC_BASE_URL SRC_OIC_INSTANCE \
+               TGT_TOKEN_URL TGT_CLIENT_ID TGT_CLIENT_SECRET TGT_SCOPE TGT_OIC_BASE_URL TGT_OIC_INSTANCE; do
+        [ -n "${!n:-}" ] && printf -v "${n}" '%s' "$(trim "${!n}")" && export "${n}"
       done
-      case "${SRC_TOKEN_URL}" in https://*) ;; *) echo "ERROR: SRC_TOKEN_URL must be https://"; exit 1 ;; esac
-      case "${TGT_TOKEN_URL}" in https://*) ;; *) echo "ERROR: TGT_TOKEN_URL must be https://"; exit 1 ;; esac
-      case "${SRC_CLIENT_ID}" in https://*) echo "ERROR: SRC_CLIENT_ID must be client id, not URL"; exit 1 ;; esac
-
+      check_required() {
+        local n="$1" v="${!1:-}"
+        [ -n "${v}" ] || { echo "ERROR: '${n}' empty — add Pipeline Parameter '${n}'"; exit 1; }
+        case "${v}" in '${'*'}'|'$'"${n}"|*'${'"${n}"'}'*) echo "ERROR: '${n}' is placeholder: ${v}"; exit 1 ;; esac
+      }
+      for n in PROJECT_ID ARCHIVE_NAME OS_BUCKET SRC_TOKEN_URL SRC_CLIENT_ID SRC_CLIENT_SECRET SRC_OIC_BASE_URL SRC_OIC_INSTANCE \
+               TGT_TOKEN_URL TGT_CLIENT_ID TGT_CLIENT_SECRET TGT_OIC_BASE_URL TGT_OIC_INSTANCE; do
+        check_required "${n}"
+      done
+      check_https_url() {
+        local name="$1" url="$2" token="$3"
+        case "${url}" in
+          https://*) ;;
+          *) echo "ERROR: ${name} must start with https:// — got: ${url:0:100}"; exit 1 ;;
+        esac
+        if [ "${token}" = "1" ]; then
+          case "${url}" in *integration*ocp.oraclecloud*|*design.integration*)
+            echo "ERROR: ${name} looks like OIC URL; use IdP */oauth2/v1/token"; exit 1 ;; esac
+        fi
+      }
+      check_https_url "SRC_TOKEN_URL" "${SRC_TOKEN_URL}" 1
+      check_https_url "TGT_TOKEN_URL" "${TGT_TOKEN_URL}" 1
+      check_https_url "SRC_OIC_BASE_URL" "${SRC_OIC_BASE_URL}" 0
+      check_https_url "TGT_OIC_BASE_URL" "${TGT_OIC_BASE_URL}" 0
+      [ "${SRC_TOKEN_URL}" != "${SRC_OIC_BASE_URL}" ] || { echo "ERROR: SRC_TOKEN_URL = SRC_OIC_BASE_URL"; exit 1; }
+      [ "${TGT_TOKEN_URL}" != "${TGT_OIC_BASE_URL}" ] || { echo "ERROR: TGT_TOKEN_URL = TGT_OIC_BASE_URL"; exit 1; }
       env_file="/tmp/oic-build.env"
       : > "${env_file}"
       for n in PROJECT_ID ARCHIVE_NAME PROJECT_LABEL OS_OBJECT_NAME OS_BUCKET OS_NAMESPACE \
                SRC_TOKEN_URL SRC_CLIENT_ID SRC_CLIENT_SECRET SRC_SCOPE SRC_OIC_BASE_URL SRC_OIC_INSTANCE \
                TGT_TOKEN_URL TGT_CLIENT_ID TGT_CLIENT_SECRET TGT_SCOPE TGT_OIC_BASE_URL TGT_OIC_INSTANCE \
                ARCHIVE_PATH OCI_CLI_AUTH; do
-        printf '%s=%q\n' "${n}" "${!n}" >> "${env_file}"
+        printf '%s=%q\n' "${n}" "${!n:-}" >> "${env_file}"
       done
       chmod 600 "${env_file}"
-      echo "SRC_TOKEN_URL host: $(echo "${SRC_TOKEN_URL}" | sed 's#https://##' | cut -d/ -f1)"
-      echo "Project: ${PROJECT_ID} | Source: ${SRC_OIC_INSTANCE} | Target: ${TGT_OIC_INSTANCE}"
-
+      echo "TGT token host: $(echo "${TGT_TOKEN_URL}" | sed 's#https://##' | cut -d/ -f1)"
+      echo "--- Pre-flight: source token ---"
+      SRC_TOKEN="$(scripts/get_token.sh "${SRC_TOKEN_URL}" "${SRC_CLIENT_ID}" "${SRC_CLIENT_SECRET}" "${SRC_SCOPE:-}")"
+      [ -n "${SRC_TOKEN}" ] && echo "Source token: OK"
+      echo "--- Pre-flight: target token ---"
+      TGT_TOKEN="$(scripts/get_token.sh "${TGT_TOKEN_URL}" "${TGT_CLIENT_ID}" "${TGT_CLIENT_SECRET}" "${TGT_SCOPE:-}")"
+      [ -n "${TGT_TOKEN}" ] && echo "Target token: OK"
+      NS="${OS_NAMESPACE:-$(oci os ns get --query data --raw-output)}"
+      export OS_NAMESPACE="${NS}"
+      printf '%s=%q\n' OS_NAMESPACE "${NS}" >> "${env_file}"
+      oci os bucket get --namespace-name "${NS}" --name "${OS_BUCKET}" >/dev/null
+      echo "Bucket OK: ${OS_BUCKET} | === Setup complete ==="
   - type: Command
     name: Export from source OIC
     command: |
       set -euo pipefail
+      [ -f /tmp/oic-build.env ] || { echo "ERROR: run Setup first"; exit 1; }
       set -a && . /tmp/oic-build.env && set +a
       cd "${OCI_PRIMARY_SOURCE_DIR:-.}"
-      echo "Export — token host: $(echo "${SRC_TOKEN_URL}" | sed 's#https://##' | cut -d/ -f1)"
-      SRC_TOKEN="$(scripts/get_token.sh "${SRC_TOKEN_URL}" "${SRC_CLIENT_ID}" "${SRC_CLIENT_SECRET}" "${SRC_SCOPE}")"
-      scripts/export_project.sh \
-        "${SRC_OIC_BASE_URL}" "${SRC_OIC_INSTANCE}" "${SRC_TOKEN}" \
-        "${PROJECT_ID}" "${PROJECT_LABEL:-}" "${ARCHIVE_PATH}"
-      test -f "${ARCHIVE_PATH}"
-      ls -la "${ARCHIVE_PATH}"
-
+      SRC_TOKEN="$(scripts/get_token.sh "${SRC_TOKEN_URL}" "${SRC_CLIENT_ID}" "${SRC_CLIENT_SECRET}" "${SRC_SCOPE:-}")"
+      scripts/export_project.sh "${SRC_OIC_BASE_URL}" "${SRC_OIC_INSTANCE}" "${SRC_TOKEN}" "${PROJECT_ID}" "${PROJECT_LABEL:-}" "${ARCHIVE_PATH}"
+      test -s "${ARCHIVE_PATH}"
   - type: Command
     name: Upload to Object Storage
     command: |
@@ -85,25 +135,21 @@ steps:
       set -a && . /tmp/oic-build.env && set +a
       cd "${OCI_PRIMARY_SOURCE_DIR:-.}"
       scripts/oss_object_put.sh "${ARCHIVE_PATH}" "${OS_BUCKET}" "${OS_OBJECT_NAME}"
-      echo "Uploaded: ${OS_OBJECT_NAME}"
-
   - type: Command
     name: Download from Object Storage
     command: |
       set -euo pipefail
       set -a && . /tmp/oic-build.env && set +a
       cd "${OCI_PRIMARY_SOURCE_DIR:-.}"
+      rm -f "${ARCHIVE_PATH}"
       scripts/oss_object_get.sh "${OS_BUCKET}" "${OS_OBJECT_NAME}" "${ARCHIVE_PATH}"
-      test -f "${ARCHIVE_PATH}"
-      ls -la "${ARCHIVE_PATH}"
-
+      test -s "${ARCHIVE_PATH}"
   - type: Command
     name: Import to target OIC
     command: |
       set -euo pipefail
       set -a && . /tmp/oic-build.env && set +a
       cd "${OCI_PRIMARY_SOURCE_DIR:-.}"
-      TGT_TOKEN="$(scripts/get_token.sh "${TGT_TOKEN_URL}" "${TGT_CLIENT_ID}" "${TGT_CLIENT_SECRET}" "${TGT_SCOPE}")"
-      scripts/import_project.sh \
-        "${TGT_OIC_BASE_URL}" "${TGT_OIC_INSTANCE}" "${TGT_TOKEN}" "${ARCHIVE_PATH}"
-      echo "Export + import complete."
+      TGT_TOKEN="$(scripts/get_token.sh "${TGT_TOKEN_URL}" "${TGT_CLIENT_ID}" "${TGT_CLIENT_SECRET}" "${TGT_SCOPE:-}")"
+      scripts/import_project.sh "${TGT_OIC_BASE_URL}" "${TGT_OIC_INSTANCE}" "${TGT_TOKEN}" "${ARCHIVE_PATH}"
+      echo "=== Export + import complete ==="
