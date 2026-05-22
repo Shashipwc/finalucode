@@ -1,0 +1,271 @@
+# =============================================================================
+# OCI DevOps — Multi-project OIC Export → Object Storage → Import
+# =============================================================================
+# Build spec path: build_spec_export_import_multi.yaml
+#
+# Repo layout (same as single-project spec):
+#   scripts/get_token.sh, export_project.sh, import_project.sh,
+#   scripts/oss_object_put.sh, scripts/oss_object_get.sh
+#
+# Pipeline → Parameters:
+#
+#   REQUIRED
+#     PROJECT_IDS         — comma-separated OIC project ids, e.g. PROJ_A,PROJ_B,PROJ_C
+#     OS_BUCKET
+#     SRC_TOKEN_URL, SRC_CLIENT_ID, SRC_CLIENT_SECRET, SRC_OIC_BASE_URL, SRC_OIC_INSTANCE
+#     TGT_TOKEN_URL, TGT_CLIENT_ID, TGT_CLIENT_SECRET, TGT_OIC_BASE_URL, TGT_OIC_INSTANCE
+#
+#   OPTIONAL
+#     SRC_SCOPE, TGT_SCOPE, PROJECT_LABEL (same label for every project in the list)
+#     OS_NAMESPACE, OS_OBJECT_PREFIX (default: oic-exports/)
+#     CONTINUE_ON_ERROR (default: false) — if true, log failures and continue; fail at end if any failed
+#
+# Per project (automatic):
+#   Archive file:  exports/<project-id>.car
+#   Object key:    <OS_OBJECT_PREFIX><project-id>.car
+#
+# IAM: resource principal on build pipeline dynamic group — manage objects in compartment
+# =============================================================================
+
+version: 0.1
+component: build
+timeoutInSeconds: 7200
+shell: bash
+failImmediatelyOnError: true
+
+env:
+  variables:
+    OS_OBJECT_PREFIX: "oic-exports/"
+    CONTINUE_ON_ERROR: "false"
+  exportedVariables:
+    - PROJECT_COUNT
+
+steps:
+  - type: Command
+    name: Setup
+    command: |
+      set -euo pipefail
+      cd "${OCI_PRIMARY_SOURCE_DIR:-.}"
+
+      echo "=== OIC Multi-Project Export + Import — Setup ==="
+      echo "Runner: $(cat /etc/oracle-release 2>/dev/null || grep PRETTY_NAME /etc/os-release 2>/dev/null || uname -a)"
+      echo "Working directory: $(pwd)"
+
+      install_pkg() {
+        local pkg="$1"
+        if command -v dnf >/dev/null 2>&1; then dnf install -y "${pkg}";
+        elif command -v yum >/dev/null 2>&1; then yum install -y "${pkg}";
+        elif command -v microdnf >/dev/null 2>&1; then microdnf install -y "${pkg}";
+        elif command -v apt-get >/dev/null 2>&1; then apt-get update -y && apt-get install -y "${pkg}";
+        else echo "ERROR: cannot install ${pkg}"; exit 1; fi
+      }
+      for pkg in jq curl; do
+        command -v "${pkg}" >/dev/null 2>&1 || { echo "Installing ${pkg}..."; install_pkg "${pkg}"; }
+        command -v "${pkg}" >/dev/null || { echo "ERROR: ${pkg} missing"; exit 1; }
+        echo "OK: ${pkg}"
+      done
+      command -v oci >/dev/null || { echo "ERROR: oci CLI missing"; exit 1; }
+      echo "OK: oci"
+
+      for f in scripts/get_token.sh scripts/export_project.sh scripts/import_project.sh \
+               scripts/oss_object_put.sh scripts/oss_object_get.sh; do
+        [ -f "${f}" ] || { echo "ERROR: missing ${f}"; exit 1; }
+        chmod +x "${f}"
+        echo "OK: ${f}"
+      done
+      mkdir -p exports
+
+      export OCI_CLI_AUTH="${OCI_CLI_AUTH:-resource_principal}"
+      export OS_OBJECT_PREFIX="${OS_OBJECT_PREFIX:-oic-exports/}"
+      case "${OS_OBJECT_PREFIX}" in */) ;; *) export OS_OBJECT_PREFIX="${OS_OBJECT_PREFIX}/" ;; esac
+      export CONTINUE_ON_ERROR="${CONTINUE_ON_ERROR:-false}"
+
+      trim() { echo "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//"; }
+      for n in PROJECT_IDS PROJECT_LABEL OS_BUCKET OS_NAMESPACE OS_OBJECT_PREFIX \
+               SRC_TOKEN_URL SRC_CLIENT_ID SRC_CLIENT_SECRET SRC_SCOPE SRC_OIC_BASE_URL SRC_OIC_INSTANCE \
+               TGT_TOKEN_URL TGT_CLIENT_ID TGT_CLIENT_SECRET TGT_SCOPE TGT_OIC_BASE_URL TGT_OIC_INSTANCE \
+               CONTINUE_ON_ERROR; do
+        if [ -n "${!n:-}" ]; then
+          printf -v "${n}" '%s' "$(trim "${!n}")"
+          export "${n}"
+        fi
+      done
+
+      check_required() {
+        local n="$1" v="${!1:-}"
+        [ -n "${v}" ] || { echo "ERROR: '${n}' empty — add Pipeline Parameter '${n}'"; exit 1; }
+        case "${v}" in '${'*'}'|'$'"${n}"|*'${'"${n}"'}'*)
+          echo "ERROR: '${n}' is placeholder: ${v}"; exit 1 ;;
+        esac
+      }
+
+      for n in PROJECT_IDS OS_BUCKET SRC_TOKEN_URL SRC_CLIENT_ID SRC_CLIENT_SECRET SRC_OIC_BASE_URL SRC_OIC_INSTANCE \
+               TGT_TOKEN_URL TGT_CLIENT_ID TGT_CLIENT_SECRET TGT_OIC_BASE_URL TGT_OIC_INSTANCE; do
+        check_required "${n}"
+      done
+
+      check_https_url() {
+        local name="$1" url="$2" is_token="$3"
+        case "${url}" in
+          https://*) ;;
+          *) echo "ERROR: ${name} must start with https:// — got: ${url:0:100}"; exit 1 ;;
+        esac
+        if [ "${is_token}" = "1" ]; then
+          case "${url}" in *integration*ocp.oraclecloud*|*design.integration*)
+            echo "ERROR: ${name} looks like OIC URL; use IdP */oauth2/v1/token"; exit 1 ;;
+          esac
+        fi
+      }
+      check_https_url "SRC_TOKEN_URL" "${SRC_TOKEN_URL}" 1
+      check_https_url "TGT_TOKEN_URL" "${TGT_TOKEN_URL}" 1
+      check_https_url "SRC_OIC_BASE_URL" "${SRC_OIC_BASE_URL}" 0
+      check_https_url "TGT_OIC_BASE_URL" "${TGT_OIC_BASE_URL}" 0
+
+      # Build project list (comma, semicolon, or whitespace separated)
+      PROJECT_LIST_FILE="/tmp/oic-project-ids.txt"
+      : > "${PROJECT_LIST_FILE}"
+      _ids="${PROJECT_IDS//;/,}"
+      _ids="${_ids// /,}"
+      IFS=',' read -ra _ARR <<< "${_ids}"
+      for _pid in "${_ARR[@]}"; do
+        _pid="$(trim "${_pid}")"
+        [ -n "${_pid}" ] || continue
+        case "${_pid}" in */*|*\\*|*' '*)
+          echo "ERROR: invalid project id '${_pid}' (no spaces or path separators)"
+          exit 1
+          ;;
+        esac
+        echo "${_pid}" >> "${PROJECT_LIST_FILE}"
+      done
+      PROJECT_COUNT="$(wc -l < "${PROJECT_LIST_FILE}" | tr -d ' ')"
+      [ "${PROJECT_COUNT}" -gt 0 ] || { echo "ERROR: PROJECT_IDS has no valid ids: ${PROJECT_IDS}"; exit 1; }
+      export PROJECT_COUNT
+      echo "Projects to process (${PROJECT_COUNT}):"
+      cat "${PROJECT_LIST_FILE}"
+
+      env_file="/tmp/oic-build.env"
+      : > "${env_file}"
+      for n in PROJECT_IDS PROJECT_COUNT PROJECT_LABEL OS_BUCKET OS_NAMESPACE OS_OBJECT_PREFIX CONTINUE_ON_ERROR \
+               SRC_TOKEN_URL SRC_CLIENT_ID SRC_CLIENT_SECRET SRC_SCOPE SRC_OIC_BASE_URL SRC_OIC_INSTANCE \
+               TGT_TOKEN_URL TGT_CLIENT_ID TGT_CLIENT_SECRET TGT_SCOPE TGT_OIC_BASE_URL TGT_OIC_INSTANCE \
+               OCI_CLI_AUTH; do
+        printf '%s=%q\n' "${n}" "${!n:-}" >> "${env_file}"
+      done
+      printf '%s=%q\n' "PROJECT_LIST_FILE" "${PROJECT_LIST_FILE}" >> "${env_file}"
+      chmod 600 "${env_file}"
+
+      echo "--- Pre-flight: tokens ---"
+      SRC_TOKEN="$(scripts/get_token.sh "${SRC_TOKEN_URL}" "${SRC_CLIENT_ID}" "${SRC_CLIENT_SECRET}" "${SRC_SCOPE:-}")"
+      [ -n "${SRC_TOKEN}" ] && echo "Source token: OK"
+      TGT_TOKEN="$(scripts/get_token.sh "${TGT_TOKEN_URL}" "${TGT_CLIENT_ID}" "${TGT_CLIENT_SECRET}" "${TGT_SCOPE:-}")"
+      [ -n "${TGT_TOKEN}" ] && echo "Target token: OK"
+
+      echo "--- Pre-flight: bucket ---"
+      NS="${OS_NAMESPACE:-$(oci os ns get --query data --raw-output)}"
+      export OS_NAMESPACE="${NS}"
+      printf '%s=%q\n' "OS_NAMESPACE" "${NS}" >> "${env_file}"
+      oci os bucket get --namespace-name "${NS}" --name "${OS_BUCKET}" >/dev/null
+      echo "Bucket OK: ${OS_BUCKET} (namespace ${NS})"
+      echo "=== Setup complete — ${PROJECT_COUNT} project(s) ==="
+
+  - type: Command
+    name: Export and upload all projects
+    command: |
+      set -euo pipefail
+      [ -f /tmp/oic-build.env ] || { echo "ERROR: run Setup first"; exit 1; }
+      set -a && . /tmp/oic-build.env && set +a
+      cd "${OCI_PRIMARY_SOURCE_DIR:-.}"
+
+      handle_fail() {
+        local pid="$1" step="$2"
+        echo "FAILED [${step}]: ${pid}"
+        FAILED=$((FAILED + 1))
+        [ "${CONTINUE_ON_ERROR}" = "true" ] || exit 1
+      }
+
+      SRC_TOKEN="$(scripts/get_token.sh "${SRC_TOKEN_URL}" "${SRC_CLIENT_ID}" "${SRC_CLIENT_SECRET}" "${SRC_SCOPE:-}")"
+      FAILED=0
+      OK=0
+      while IFS= read -r PROJECT_ID; do
+        [ -n "${PROJECT_ID}" ] || continue
+        ARCHIVE_PATH="exports/${PROJECT_ID}.car"
+        OS_OBJECT_NAME="${OS_OBJECT_PREFIX}${PROJECT_ID}.car"
+        echo ""
+        echo "========== [Export+Upload] ${PROJECT_ID} =========="
+        echo "  Archive: ${ARCHIVE_PATH}"
+        echo "  Object:  ${OS_OBJECT_NAME}"
+
+        if ! scripts/export_project.sh \
+          "${SRC_OIC_BASE_URL}" "${SRC_OIC_INSTANCE}" "${SRC_TOKEN}" \
+          "${PROJECT_ID}" "${PROJECT_LABEL:-}" "${ARCHIVE_PATH}"; then
+          handle_fail "${PROJECT_ID}" "export"
+          continue
+        fi
+
+        if [ ! -s "${ARCHIVE_PATH}" ]; then
+          handle_fail "${PROJECT_ID}" "export-empty"
+          continue
+        fi
+
+        if scripts/oss_object_put.sh "${ARCHIVE_PATH}" "${OS_BUCKET}" "${OS_OBJECT_NAME}"; then
+          OK=$((OK + 1))
+          echo "OK: ${PROJECT_ID}"
+        else
+          handle_fail "${PROJECT_ID}" "upload"
+        fi
+      done < "${PROJECT_LIST_FILE}"
+
+      echo ""
+      echo "Export+Upload summary: ok=${OK} failed=${FAILED} total=${PROJECT_COUNT}"
+      [ "${FAILED}" -eq 0 ] || exit 1
+
+  - type: Command
+    name: Download and import all projects
+    command: |
+      set -euo pipefail
+      [ -f /tmp/oic-build.env ] || { echo "ERROR: run Setup first"; exit 1; }
+      set -a && . /tmp/oic-build.env && set +a
+      cd "${OCI_PRIMARY_SOURCE_DIR:-.}"
+
+      handle_fail() {
+        local pid="$1" step="$2"
+        echo "FAILED [${step}]: ${pid}"
+        FAILED=$((FAILED + 1))
+        [ "${CONTINUE_ON_ERROR}" = "true" ] || exit 1
+      }
+
+      TGT_TOKEN="$(scripts/get_token.sh "${TGT_TOKEN_URL}" "${TGT_CLIENT_ID}" "${TGT_CLIENT_SECRET}" "${TGT_SCOPE:-}")"
+      FAILED=0
+      OK=0
+      while IFS= read -r PROJECT_ID; do
+        [ -n "${PROJECT_ID}" ] || continue
+        ARCHIVE_PATH="exports/${PROJECT_ID}.car"
+        OS_OBJECT_NAME="${OS_OBJECT_PREFIX}${PROJECT_ID}.car"
+        echo ""
+        echo "========== [Download+Import] ${PROJECT_ID} =========="
+        echo "  Object:  ${OS_OBJECT_NAME}"
+
+        rm -f "${ARCHIVE_PATH}"
+        if ! scripts/oss_object_get.sh "${OS_BUCKET}" "${OS_OBJECT_NAME}" "${ARCHIVE_PATH}"; then
+          handle_fail "${PROJECT_ID}" "download"
+          continue
+        fi
+
+        if [ ! -s "${ARCHIVE_PATH}" ]; then
+          handle_fail "${PROJECT_ID}" "download-empty"
+          continue
+        fi
+
+        if scripts/import_project.sh \
+          "${TGT_OIC_BASE_URL}" "${TGT_OIC_INSTANCE}" "${TGT_TOKEN}" "${ARCHIVE_PATH}"; then
+          OK=$((OK + 1))
+          echo "OK: ${PROJECT_ID}"
+        else
+          handle_fail "${PROJECT_ID}" "import"
+        fi
+      done < "${PROJECT_LIST_FILE}"
+
+      echo ""
+      echo "Download+Import summary: ok=${OK} failed=${FAILED} total=${PROJECT_COUNT}"
+      [ "${FAILED}" -eq 0 ] || exit 1
+      echo "=== Multi-project export + import complete (${PROJECT_COUNT} projects) ==="
